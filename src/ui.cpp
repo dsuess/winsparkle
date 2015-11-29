@@ -42,6 +42,7 @@
 #include <wx/dialog.h>
 #include <wx/display.h>
 #include <wx/evtloop.h>
+#include <wx/intl.h>
 #include <wx/sizer.h>
 #include <wx/button.h>
 #include <wx/filename.h>
@@ -55,10 +56,16 @@
 
 #include <exdisp.h>
 #include <mshtml.h>
+#include <commctrl.h>
 
 
 #if !wxCHECK_VERSION(2,9,0)
 #error "wxWidgets >= 2.9 is required to compile this code"
+#endif
+
+// Hack to build with Fedora 20 MinGW
+#ifndef ERROR_RESOURCE_ENUM_USER_STOP
+#define ERROR_RESOURCE_ENUM_USER_STOP                      15106
 #endif
 
 namespace winsparkle
@@ -89,10 +96,7 @@ wxIcon LoadNamedIcon(HMODULE module, const wchar_t *iconName, int size)
 {
     HICON hIcon = NULL;
 
-    typedef HRESULT(WINAPI *LPFN_LOADICONWITHSCALEDOWN)(HINSTANCE, PCWSTR, int, int, HICON*);
-    LPFN_LOADICONWITHSCALEDOWN f_LoadIconWithScaleDown =
-        (LPFN_LOADICONWITHSCALEDOWN) GetProcAddress(GetModuleHandleA("comctl32"), "LoadIconWithScaleDown");
-
+    auto f_LoadIconWithScaleDown = LOAD_DYNAMIC_FUNC(LoadIconWithScaleDown, comctl32);
     if (f_LoadIconWithScaleDown)
     {
         if (FAILED(f_LoadIconWithScaleDown(module, iconName, size, size, &hIcon)))
@@ -150,6 +154,7 @@ struct EventPayload
     Appcast      appcast;
     size_t       sizeDownloaded, sizeTotal;
     std::wstring updateFile;
+    bool         installAutomatically;
 };
 
 
@@ -218,7 +223,11 @@ void CenterWindowOnHostApplication(wxTopLevelWindow *win)
     EnumWindows(EnumProcessWindowsCallback, (LPARAM) &data);
 
     if (data.biggest.IsEmpty())
-        return; // no window to center on
+    {
+        // no parent window to center on, so center on the screen
+        win->Center();
+        return;
+    }
 
     const wxRect& host(data.biggest);
 
@@ -268,6 +277,12 @@ struct LayoutChangesGuard
     }
 
     wxTopLevelWindow *m_win;
+};
+
+class DllTranslationsLoader : public wxResourceTranslationsLoader
+{
+protected:
+    virtual WXHINSTANCE GetModule() const { return UI::GetDllHINSTANCE(); }
 };
 
 } // anonymous namespace
@@ -401,17 +416,17 @@ public:
     // changes state into "checking for updates"
     void StateCheckingUpdates();
     // change state into "no updates found"
-    void StateNoUpdateFound();
+    void StateNoUpdateFound(bool installAutomatically);
     // change state into "update error"
     void StateUpdateError();
     // change state into "a new version is available"
-    void StateUpdateAvailable(const Appcast& info);
+    void StateUpdateAvailable(const Appcast& info, bool installAutomatically);
     // change state into "downloading update"
     void StateDownloading();
     // update download progress
     void DownloadProgress(size_t downloaded, size_t total);
     // change state into "update downloaded"
-    void StateUpdateDownloaded(const std::wstring& updateFile);
+    void StateUpdateDownloaded(const std::wstring& updateFile, const std::string &installerArguments);
 
 private:
     void EnablePulsing(bool enable);
@@ -424,6 +439,8 @@ private:
     void OnInstall(wxCommandEvent&);
 
     void OnRunInstaller(wxCommandEvent&);
+
+    bool RunInstaller();
 
     void SetMessage(const wxString& text, int width = MESSAGE_AREA_WIDTH);
     void ShowReleaseNotes(const Appcast& info);
@@ -450,8 +467,14 @@ private:
     Appcast m_appcast;
     // current update file (only valid after StateUpdateDownloaded)
     wxString m_updateFile;
+    // space separated arguments to update file (only valid after StateUpdateDownloaded)
+    std::string m_installerArguments;
     // downloader (only valid between OnInstall and OnUpdateDownloaded)
     UpdateDownloader* m_downloader;
+    // whether the update should be installed without prompting the user
+    bool m_installAutomatically;
+    // whether an error occurred (used to properly call NotifyUpdateCancelled)
+    bool m_errorOccurred;
 
     static const int RELNOTES_WIDTH = 460;
     static const int RELNOTES_HEIGHT = 200;
@@ -462,6 +485,9 @@ UpdateDialog::UpdateDialog()
     : m_timer(this),
       m_downloader(NULL)
 {
+    m_installAutomatically = false;
+    m_errorOccurred = false;
+
     m_heading = new wxStaticText(this, wxID_ANY, "");
     SetHeadingFont(m_heading);
     m_mainAreaSizer->Add(m_heading, wxSizerFlags(0).Expand().Border(wxBOTTOM, PX(10)));
@@ -587,6 +613,18 @@ void UpdateDialog::OnClose(wxCloseEvent&)
     // We need to override this, because by default, wxDialog doesn't
     // destroy itself in Close().
     Destroy();
+
+    // If the update was not downloaded and the appcast is empty and we're closing,
+    // it means that we're about to restart or there was an error, and that the
+    // window-close event wasn't initiated by the user.
+    if ( m_errorOccurred )
+    {
+        ApplicationController::NotifyUpdateError();
+    }
+    else if ( m_appcast.IsValid() && m_updateFile.IsEmpty() )
+    {
+        ApplicationController::NotifyUpdateCancelled();
+    }
 }
 
 
@@ -640,7 +678,7 @@ void UpdateDialog::OnRunInstaller(wxCommandEvent&)
     m_message->SetLabel(_("Launching the installer..."));
     m_runInstallerButton->Disable();
 
-    if ( !wxLaunchDefaultApplication(m_updateFile) )
+    if ( !RunInstaller() )
     {
         wxMessageDialog dlg(this,
             _("Failed to launch the installer."),
@@ -655,6 +693,20 @@ void UpdateDialog::OnRunInstaller(wxCommandEvent&)
     }
 }
 
+bool UpdateDialog::RunInstaller()
+{
+    if (m_installerArguments.empty()) 
+    {
+        // keep old way of calling updater to not accidentally break any existing code
+        return wxLaunchDefaultApplication(m_updateFile);
+    } 
+    else 
+    {
+        // wxExecute() returns a process id, or zero on failure
+        long processId = wxExecute(m_updateFile + " " + m_installerArguments);
+        return processId != 0;
+    }
+}
 
 void UpdateDialog::SetMessage(const wxString& text, int width)
 {
@@ -683,8 +735,18 @@ void UpdateDialog::StateCheckingUpdates()
 }
 
 
-void UpdateDialog::StateNoUpdateFound()
+void UpdateDialog::StateNoUpdateFound(bool installAutomatically)
 {
+    m_installAutomatically = installAutomatically;
+
+    ApplicationController::NotifyUpdateNotFound();
+
+    if ( m_installAutomatically )
+    {
+        Close();
+        return;
+    }
+
     LayoutChangesGuard guard(this);
 
     m_heading->SetLabel(_("You're up to date!"));
@@ -724,6 +786,8 @@ void UpdateDialog::StateNoUpdateFound()
 
 void UpdateDialog::StateUpdateError()
 {
+    m_errorOccurred = true;
+
     LayoutChangesGuard guard(this);
 
     m_heading->SetLabel(_("Update Error!"));
@@ -747,9 +811,17 @@ void UpdateDialog::StateUpdateError()
 
 
 
-void UpdateDialog::StateUpdateAvailable(const Appcast& info)
+void UpdateDialog::StateUpdateAvailable(const Appcast& info, bool installAutomatically)
 {
     m_appcast = info;
+    m_installAutomatically = installAutomatically;
+
+    if ( installAutomatically )
+    {
+        wxCommandEvent nullEvent;
+        OnInstall(nullEvent);
+        return;
+    }
 
     const bool showRelnotes = !info.ReleaseNotesURL.empty() || !info.Description.empty();
 
@@ -836,6 +908,7 @@ void UpdateDialog::DownloadProgress(size_t downloaded, size_t total)
         m_progress->SetValue(downloaded);
         label = wxString::Format
                 (
+                    // TRANSLATORS: This is the progress of a download, e.g. "3 MB of 12 MB".
                     _("%s of %s"),
                     wxFileName::GetHumanReadableSize(downloaded, "", 1, wxSIZE_CONV_SI),
                     wxFileName::GetHumanReadableSize(total, "", 1, wxSIZE_CONV_SI)
@@ -855,13 +928,21 @@ void UpdateDialog::DownloadProgress(size_t downloaded, size_t total)
 }
 
 
-void UpdateDialog::StateUpdateDownloaded(const std::wstring& updateFile)
+void UpdateDialog::StateUpdateDownloaded(const std::wstring& updateFile, const std::string& installerArguments)
 {
     m_downloader->Join();
     delete m_downloader;
     m_downloader = NULL;
 
     m_updateFile = updateFile;
+    m_installerArguments = installerArguments;
+
+    if ( m_installAutomatically )
+    {
+        wxCommandEvent nullEvent;
+        OnRunInstaller(nullEvent);
+        return;
+    }
 
     LayoutChangesGuard guard(this);
 
@@ -1085,6 +1166,8 @@ class App : public wxApp
 public:
     App();
 
+    virtual bool OnInit();
+
     // Sends a message with ID @a msg to the app.
     void SendMsg(int msg, EventPayload *data = NULL);
 
@@ -1136,6 +1219,41 @@ App::App()
     Bind(wxEVT_COMMAND_THREAD, &App::OnDownloadProgress, this, MSG_DOWNLOAD_PROGRESS);
     Bind(wxEVT_COMMAND_THREAD, &App::OnUpdateDownloaded, this, MSG_UPDATE_DOWNLOADED);
     Bind(wxEVT_COMMAND_THREAD, &App::OnAskForPermission, this, MSG_ASK_FOR_PERMISSION);
+}
+
+
+bool App::OnInit()
+{
+    if (!wxApp::OnInit())
+        return false;
+
+    wxString language;
+    Settings::Lang langset = Settings::GetLanguage();
+    if (!langset.lang.empty())
+    {
+        language = langset.lang;
+    }
+    else if (langset.langid != 0)
+    {
+        auto f_LCIDToLocaleName = LOAD_DYNAMIC_FUNC(LCIDToLocaleName, kernel32);
+        if (f_LCIDToLocaleName)
+        {
+            WCHAR strNameBuffer[LOCALE_NAME_MAX_LENGTH];
+            if (f_LCIDToLocaleName(MAKELCID(langset.langid, SORT_DEFAULT), strNameBuffer, LOCALE_NAME_MAX_LENGTH, 0) != 0)
+                language = strNameBuffer;
+        }
+        // else: just use the default on Windows XP
+    }
+    language.Replace("-", "_");
+
+    wxTranslations *trans = new wxTranslations();
+    wxTranslations::Set(trans);
+
+    trans->SetLoader(new DllTranslationsLoader());
+    trans->SetLanguage(language);
+    trans->AddCatalog("winsparkle");
+
+    return true;
 }
 
 
@@ -1196,10 +1314,13 @@ void App::OnShowCheckingUpdates(wxThreadEvent&)
 }
 
 
-void App::OnNoUpdateFound(wxThreadEvent&)
+void App::OnNoUpdateFound(wxThreadEvent& event)
 {
     if ( m_win )
-        m_win->StateNoUpdateFound();
+    {
+        EventPayload payload(event.GetPayload<EventPayload>());
+        m_win->StateNoUpdateFound(payload.installAutomatically);
+    }
 }
 
 
@@ -1223,7 +1344,7 @@ void App::OnUpdateDownloaded(wxThreadEvent& event)
     if ( m_win )
     {
         EventPayload payload(event.GetPayload<EventPayload>());
-        m_win->StateUpdateDownloaded(payload.updateFile);
+        m_win->StateUpdateDownloaded(payload.updateFile, payload.appcast.InstallerArguments);
     }
 }
 
@@ -1233,7 +1354,7 @@ void App::OnUpdateAvailable(wxThreadEvent& event)
     InitWindow();
 
     EventPayload payload(event.GetPayload<EventPayload>());
-    m_win->StateUpdateAvailable(payload.appcast);
+    m_win->StateUpdateAvailable(payload.appcast, payload.installAutomatically);
 
     ShowWindow();
 }
@@ -1264,11 +1385,11 @@ class UIThreadAccess
 public:
     UIThreadAccess() : m_lock(ms_uiThreadCS) {}
 
-    App& App()
+    winsparkle::App& App()
     {
         StartIfNeeded();
         return wxGetApp();
-    };
+    }
 
     bool IsRunning() const { return ms_uiThread != NULL; }
 
@@ -1358,23 +1479,26 @@ void UI::ShutDown()
 
 
 /*static*/
-void UI::NotifyNoUpdates()
+void UI::NotifyNoUpdates(bool installAutomatically)
 {
     UIThreadAccess uit;
+    EventPayload payload;
+    payload.installAutomatically = installAutomatically;
 
     if ( !uit.IsRunning() )
         return;
 
-    uit.App().SendMsg(MSG_NO_UPDATE_FOUND);
+    uit.App().SendMsg(MSG_NO_UPDATE_FOUND, &payload);
 }
 
 
 /*static*/
-void UI::NotifyUpdateAvailable(const Appcast& info)
+void UI::NotifyUpdateAvailable(const Appcast& info, bool installAutomatically)
 {
     UIThreadAccess uit;
     EventPayload payload;
     payload.appcast = info;
+    payload.installAutomatically = installAutomatically;
     uit.App().SendMsg(MSG_UPDATE_AVAILABLE, &payload);
 }
 
@@ -1391,11 +1515,12 @@ void UI::NotifyDownloadProgress(size_t downloaded, size_t total)
 
 
 /*static*/
-void UI::NotifyUpdateDownloaded(const std::wstring& updateFile)
+void UI::NotifyUpdateDownloaded(const std::wstring& updateFile, const Appcast &appcast)
 {
     UIThreadAccess uit;
     EventPayload payload;
     payload.updateFile = updateFile;
+    payload.appcast = appcast;
     uit.App().SendMsg(MSG_UPDATE_DOWNLOADED, &payload);
 }
 

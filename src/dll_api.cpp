@@ -33,6 +33,7 @@
 #include "updatedownloader.h"
 
 #include <ctime>
+#include <windows.h>
 
 using namespace winsparkle;
 
@@ -47,9 +48,28 @@ WIN_SPARKLE_API void __cdecl win_sparkle_init()
 {
     try
     {
+        // finish initialization
+        if (!Settings::GetLanguage().IsOk())
+        {
+            LANGID lang = 0;
+            if (IsWindowsVistaOrGreater())
+            {
+                auto f_GetThreadUILanguage = LOAD_DYNAMIC_FUNC(GetThreadUILanguage, kernel32);
+                if (f_GetThreadUILanguage)
+                    lang = f_GetThreadUILanguage();
+            }
+            if (PRIMARYLANGID(lang) == 0)
+            {
+                lang = LANGIDFROMLCID(GetThreadLocale());
+            }
+            if (PRIMARYLANGID(lang) != 0)
+                Settings::SetLanguage(lang);
+        }
+
         // first things first
         UpdateDownloader::CleanLeftovers();
 
+        // check for updates
         bool checkUpdates;
         if ( Settings::ReadConfigValue("CheckForUpdates", checkUpdates) )
         {
@@ -101,6 +121,29 @@ WIN_SPARKLE_API void __cdecl win_sparkle_cleanup()
         UI::ShutDown();
 
         // FIXME: shut down any worker UpdateChecker and UpdateDownloader threads too
+    }
+    CATCH_ALL_EXCEPTIONS
+}
+
+
+/*--------------------------------------------------------------------------*
+                              Language Settings
+*--------------------------------------------------------------------------*/
+
+WIN_SPARKLE_API void __cdecl win_sparkle_set_lang(const char *lang)
+{
+    try
+    {
+        Settings::SetLanguage(lang);
+    }
+    CATCH_ALL_EXCEPTIONS
+}
+
+WIN_SPARKLE_API void __cdecl win_sparkle_set_langid(unsigned short lang)
+{
+    try
+    {
+        Settings::SetLanguage(lang);
     }
     CATCH_ALL_EXCEPTIONS
 }
@@ -219,6 +262,15 @@ WIN_SPARKLE_API time_t __cdecl win_sparkle_get_last_check_time()
     return DEFAULT_LAST_CHECK_TIME;
 }
 
+WIN_SPARKLE_API void __cdecl win_sparkle_set_error_callback(win_sparkle_error_callback_t callback)
+{
+    try
+    {
+        ApplicationController::SetErrorCallback(callback);
+    }
+    CATCH_ALL_EXCEPTIONS
+}
+
 WIN_SPARKLE_API void __cdecl win_sparkle_set_can_shutdown_callback(win_sparkle_can_shutdown_callback_t callback)
 {
     try
@@ -237,6 +289,24 @@ WIN_SPARKLE_API void __cdecl win_sparkle_set_shutdown_request_callback(win_spark
     CATCH_ALL_EXCEPTIONS
 }
 
+WIN_SPARKLE_API void __cdecl win_sparkle_set_did_not_find_update_callback(win_sparkle_did_not_find_update_callback_t callback)
+{
+    try
+    {
+        ApplicationController::SetDidNotFindUpdateCallback(callback);
+    }
+    CATCH_ALL_EXCEPTIONS
+}
+
+WIN_SPARKLE_API void __cdecl win_sparkle_set_update_cancelled_callback(win_sparkle_update_cancelled_callback_t callback)
+{
+    try
+    {
+        ApplicationController::SetUpdateCancelledCallback(callback);
+    }
+    CATCH_ALL_EXCEPTIONS
+}
+
 /*--------------------------------------------------------------------------*
                               Manual usage
  *--------------------------------------------------------------------------*/
@@ -250,6 +320,20 @@ WIN_SPARKLE_API void __cdecl win_sparkle_check_update_with_ui()
 
         // Then run the actual check in the background.
         UpdateChecker *check = new ManualUpdateChecker();
+        check->Start();
+    }
+    CATCH_ALL_EXCEPTIONS
+}
+
+WIN_SPARKLE_API void __cdecl win_sparkle_check_update_with_ui_and_install()
+{
+    try
+    {
+        // Initialize UI thread and show progress indicator.
+        UI::ShowCheckingUpdates();
+
+        // Then run the actual check in the background.
+        UpdateChecker *check = new ManualAutoInstallUpdateChecker();
         check->Start();
     }
     CATCH_ALL_EXCEPTIONS

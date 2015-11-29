@@ -70,10 +70,7 @@ std::wstring MakeUserAgent()
     userAgent += L" (Win64)";
 #else
     // If we're running a 32bit process, check if we're on 64bit Windows OS:
-    typedef BOOL (WINAPI *LPFN_ISWOW64PROCESS)(HANDLE, PBOOL);
-    LPFN_ISWOW64PROCESS f_IsWow64Process =
-        (LPFN_ISWOW64PROCESS)GetProcAddress(GetModuleHandleA("kernel32"), "IsWow64Process");
-
+    auto f_IsWow64Process = LOAD_DYNAMIC_FUNC(IsWow64Process, kernel32);
     if( f_IsWow64Process )
     {
         BOOL wow64 = FALSE;
@@ -152,7 +149,7 @@ void DownloadFile(const std::string& url, IDownloadSink *sink, int flags)
                           NULL, // lpszHeaders
                           -1,   // dwHeadersLength
                           dwFlags,
-                          NULL  // dwContext
+                          (DWORD_PTR)NULL  // dwContext
                       );
     if ( !conn )
         throw Win32Exception();
